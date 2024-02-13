@@ -6,6 +6,7 @@ import androidx.webkit.JavaScriptReplyProxy;
 import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 import org.apache.cordova.PluginManager;
+import org.mozilla.geckoview.GeckoView;
 
 /**
  * MessageHandler handles messages from the WebView, dispatching them
@@ -14,11 +15,11 @@ import org.apache.cordova.PluginManager;
 public class MessageHandler {
 
     private Bridge bridge;
-    private WebView webView;
+    private GeckoView webView;
     private PluginManager cordovaPluginManager;
     private JavaScriptReplyProxy javaScriptReplyProxy;
 
-    public MessageHandler(Bridge bridge, WebView webView, PluginManager cordovaPluginManager) {
+    public MessageHandler(Bridge bridge, GeckoView webView, PluginManager cordovaPluginManager) {
         this.bridge = bridge;
         this.webView = webView;
         this.cordovaPluginManager = cordovaPluginManager;
@@ -32,13 +33,13 @@ public class MessageHandler {
                     Logger.warn("Plugin execution is allowed in Main Frame only");
                 }
             };
-            try {
-                WebViewCompat.addWebMessageListener(webView, "androidBridge", bridge.getAllowedOriginRules(), capListener);
-            } catch (Exception ex) {
-                webView.addJavascriptInterface(this, "androidBridge");
-            }
+//            try {
+//                WebViewCompat.addWebMessageListener(webView, "androidBridge", bridge.getAllowedOriginRules(), capListener);
+//            } catch (Exception ex) {
+//                webView.addJavascriptInterface(this, "androidBridge");
+//            }
         } else {
-            webView.addJavascriptInterface(this, "androidBridge");
+//            webView.addJavascriptInterface(this, "androidBridge");
         }
     }
 
@@ -140,8 +141,7 @@ public class MessageHandler {
 
     private void legacySendResponseMessage(PluginResult data) {
         final String runScript = "window.Capacitor.fromNative(" + data.toString() + ")";
-        final WebView webView = this.webView;
-        webView.post(() -> webView.evaluateJavascript(runScript, null));
+        this.webView.post(()->  this.bridge.getWebExtensionPortProxy().eval(runScript));
     }
 
     private void callPluginMethod(String callbackId, String pluginId, String methodName, JSObject methodData) {

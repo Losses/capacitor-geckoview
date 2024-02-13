@@ -62,6 +62,7 @@ public class CapConfig {
     // Config Object JSON (legacy)
     private JSONObject configJSON = new JSONObject();
 
+    private int port;
     /**
      * Constructs an empty config file.
      */
@@ -87,7 +88,12 @@ public class CapConfig {
 
         deserializeConfig(null);
     }
-
+    public int getPort() {
+        return port;
+    }
+    public void setPort(int port){
+        this.port=port;
+    }
     /**
      * Constructs a Capacitor Configuration from config.json file.
      *
@@ -324,7 +330,7 @@ public class CapConfig {
     }
 
     public String getHostname() {
-        return hostname;
+        return hostname+":"+port;
     }
 
     public String getStartPath() {

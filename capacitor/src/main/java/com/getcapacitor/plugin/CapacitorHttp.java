@@ -29,7 +29,7 @@ public class CapacitorHttp extends Plugin {
 
     @Override
     public void load() {
-        this.bridge.getWebView().addJavascriptInterface(this, "CapacitorHttpAndroidInterface");
+//        this.bridge.getWebView().addJavascriptInterface(this, "CapacitorHttpAndroidInterface");
         super.load();
     }
 

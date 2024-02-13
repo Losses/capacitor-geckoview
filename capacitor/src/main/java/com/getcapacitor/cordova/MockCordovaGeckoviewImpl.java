@@ -3,12 +3,11 @@ package com.getcapacitor.cordova;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Handler;
+import android.text.TextUtils;
 import android.view.View;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
-import android.webkit.WebView;
-import java.util.List;
-import java.util.Map;
+import com.getcapacitor.WebExtensionPortProxy;
 import org.apache.cordova.CordovaInterface;
 import org.apache.cordova.CordovaPreferences;
 import org.apache.cordova.CordovaResourceApi;
@@ -19,8 +18,14 @@ import org.apache.cordova.NativeToJsMessageQueue;
 import org.apache.cordova.PluginEntry;
 import org.apache.cordova.PluginManager;
 import org.apache.cordova.PluginResult;
+import org.mozilla.geckoview.GeckoView;
 
-public class MockCordovaWebViewImpl implements CordovaWebView {
+import java.util.List;
+import java.util.Map;
+
+import fi.iki.elonen.NanoHTTPD;
+
+public class MockCordovaGeckoviewImpl implements CordovaWebView {
 
     private Context context;
     private PluginManager pluginManager;
@@ -28,14 +33,15 @@ public class MockCordovaWebViewImpl implements CordovaWebView {
     private CordovaResourceApi resourceApi;
     private NativeToJsMessageQueue nativeToJsMessageQueue;
     private CordovaInterface cordova;
-    private CapacitorCordovaCookieManager cookieManager;
-    private WebView webView;
+    private CapacitorCordovaGeckoViewCookieManager cookieManager;
+    private GeckoView webView;
     private boolean hasPausedEver;
-
-    public MockCordovaWebViewImpl(Context context) {
-        this.context = context;
+    private NanoHTTPD httpd;
+    private WebExtensionPortProxy proxy;
+    private CapacitorEvalBridgeMode mode;
+    public MockCordovaGeckoviewImpl(Context context){
+        this.context=context;
     }
-
     @Override
     public void init(CordovaInterface cordova, List<PluginEntry> pluginEntries, CordovaPreferences preferences) {
         this.cordova = cordova;
@@ -44,42 +50,50 @@ public class MockCordovaWebViewImpl implements CordovaWebView {
         this.resourceApi = new CordovaResourceApi(this.context, this.pluginManager);
         this.pluginManager.init();
     }
-
-    public void init(CordovaInterface cordova, List<PluginEntry> pluginEntries, CordovaPreferences preferences, WebView webView) {
+    public void init(CordovaInterface cordova, List<PluginEntry> pluginEntries, CordovaPreferences preferences,GeckoView webView){
         this.cordova = cordova;
         this.webView = webView;
         this.preferences = preferences;
         this.pluginManager = new PluginManager(this, this.cordova, pluginEntries);
         this.resourceApi = new CordovaResourceApi(this.context, this.pluginManager);
         nativeToJsMessageQueue = new NativeToJsMessageQueue();
-        nativeToJsMessageQueue.addBridgeMode(new CapacitorEvalBridgeMode(webView, this.cordova));
+        mode = new MockCordovaGeckoviewImpl.CapacitorEvalBridgeMode(webView, this.cordova);
+        nativeToJsMessageQueue.addBridgeMode(mode);
         nativeToJsMessageQueue.setBridgeMode(0);
-        this.cookieManager = new CapacitorCordovaCookieManager(webView);
+        this.cookieManager = new CapacitorCordovaGeckoViewCookieManager(webView);
         this.pluginManager.init();
     }
-
+    public void setProxy(WebExtensionPortProxy proxy){
+        this.proxy = proxy;
+        mode.setProxy(proxy);
+    }
+    public void setHttpServer(NanoHTTPD server){
+        this.httpd=server;
+    }
     public static class CapacitorEvalBridgeMode extends NativeToJsMessageQueue.BridgeMode {
 
-        private final WebView webView;
+        private final GeckoView webView;
         private final CordovaInterface cordova;
-
-        public CapacitorEvalBridgeMode(WebView webView, CordovaInterface cordova) {
+        private WebExtensionPortProxy proxy;
+        public CapacitorEvalBridgeMode(GeckoView webView, CordovaInterface cordova) {
             this.webView = webView;
             this.cordova = cordova;
         }
-
+        public void setProxy(WebExtensionPortProxy proxy){
+            this.proxy = proxy;
+        }
         @Override
         public void onNativeToJsMessageAvailable(final NativeToJsMessageQueue queue) {
             cordova
-                .getActivity()
-                .runOnUiThread(
-                    () -> {
-                        String js = queue.popAndEncodeAsJs();
-                        if (js != null) {
-                            webView.evaluateJavascript(js, null);
-                        }
-                    }
-                );
+                    .getActivity()
+                    .runOnUiThread(
+                            () -> {
+                                String js = queue.popAndEncodeAsJs();
+                                if (js != null) {
+                                        proxy.eval(js);
+                                }
+                            }
+                    );
         }
     }
 
@@ -96,13 +110,15 @@ public class MockCordovaWebViewImpl implements CordovaWebView {
     @Override
     public void loadUrlIntoView(String url, boolean recreatePlugins) {
         if (url.equals("about:blank") || url.startsWith("javascript:")) {
-            webView.loadUrl(url);
+            webView.getSession().loadUri(url);
             return;
         }
     }
 
     @Override
-    public void stopLoading() {}
+    public void stopLoading() {
+        webView.getSession().stop();
+    }
 
     @Override
     public boolean canGoBack() {
@@ -110,13 +126,19 @@ public class MockCordovaWebViewImpl implements CordovaWebView {
     }
 
     @Override
-    public void clearCache() {}
+    public void clearCache() {
+
+    }
 
     @Override
-    public void clearCache(boolean b) {}
+    public void clearCache(boolean b) {
+
+    }
 
     @Override
-    public void clearHistory() {}
+    public void clearHistory() {
+
+    }
 
     @Override
     public boolean backHistory() {
@@ -156,7 +178,6 @@ public class MockCordovaWebViewImpl implements CordovaWebView {
             triggerDocumentEvent("resume");
         }
     }
-
     @Override
     public void handleStart() {
         if (!isInitialized()) {
@@ -179,6 +200,8 @@ public class MockCordovaWebViewImpl implements CordovaWebView {
             return;
         }
         this.pluginManager.onDestroy();
+
+        if(this.httpd!=null)httpd.stop();
     }
 
     @Override
@@ -187,8 +210,15 @@ public class MockCordovaWebViewImpl implements CordovaWebView {
     }
 
     public void eval(final String js, final ValueCallback<String> callback) {
+        if(TextUtils.isEmpty(js))
+            return ;
         Handler mainHandler = new Handler(context.getMainLooper());
-        mainHandler.post(() -> webView.evaluateJavascript(js, callback));
+//        mainHandler.post(() -> webView.evaluateJavascript(js, callback));
+        try {
+            proxy.eval(js);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
     public void triggerDocumentEvent(final String eventName) {
@@ -249,7 +279,7 @@ public class MockCordovaWebViewImpl implements CordovaWebView {
 
     @Override
     public String getUrl() {
-        return webView.getUrl();
+        return "";
     }
 
     @Override
@@ -268,12 +298,6 @@ public class MockCordovaWebViewImpl implements CordovaWebView {
     }
 
     public void setPaused(boolean value) {
-        if (value) {
-            webView.onPause();
-            webView.pauseTimers();
-        } else {
-            webView.onResume();
-            webView.resumeTimers();
-        }
+//        empty implementation
     }
 }
