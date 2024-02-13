@@ -5,9 +5,9 @@
     android:background="#F0FF1414"
     tools:context="com.getcapacitor.BridgeFragment">
 
-  <com.getcapacitor.CapacitorWebView
+  <org.mozilla.geckoview.GeckoView
       android:id="@+id/webview"
-      android:layout_width="fill_parent"
-      android:layout_height="fill_parent" />
+      android:layout_width="match_parent"
+      android:layout_height="match_parent" />
 
 </FrameLayout>

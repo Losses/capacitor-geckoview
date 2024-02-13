@@ -15,9 +15,13 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.text.TextUtils;
+import android.util.Log;
+import android.view.ViewTreeObserver;
 import android.webkit.ValueCallback;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
+
 import androidx.activity.result.ActivityResultCallback;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContract;
@@ -26,15 +30,20 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.pm.PackageInfoCompat;
 import androidx.fragment.app.Fragment;
+
 import com.getcapacitor.android.R;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.cordova.MockCordovaGeckoviewImpl;
 import com.getcapacitor.cordova.MockCordovaInterfaceImpl;
 import com.getcapacitor.cordova.MockCordovaWebViewImpl;
+import com.getcapacitor.httpserver.SimpleHttpServer;
 import com.getcapacitor.util.HostMask;
 import com.getcapacitor.util.PermissionHelper;
 import com.getcapacitor.util.WebColor;
+
 import java.io.File;
+import java.io.IOException;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.util.ArrayList;
@@ -44,30 +53,40 @@ import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
+
 import org.apache.cordova.ConfigXmlParser;
 import org.apache.cordova.CordovaPreferences;
 import org.apache.cordova.CordovaWebView;
 import org.apache.cordova.PluginEntry;
 import org.apache.cordova.PluginManager;
 import org.json.JSONException;
+import org.mozilla.geckoview.GeckoRuntime;
+import org.mozilla.geckoview.GeckoRuntimeSettings;
+import org.mozilla.geckoview.GeckoSession;
+import org.mozilla.geckoview.GeckoSessionSettings;
+import org.mozilla.geckoview.GeckoView;
+import org.mozilla.geckoview.WebExtension;
+
+import fi.iki.elonen.NanoHTTPD;
 
 /**
  * The Bridge class is the main engine of Capacitor. It manages
  * loading and communicating with all Plugins,
  * proxying Native events to Plugins, executing Plugin methods,
  * communicating with the WebView, and a whole lot more.
- *
+ * <p>
  * Generally, you'll not use Bridge directly, instead, extend from BridgeActivity
  * to get a WebView instance and proxy native events automatically.
- *
+ * <p>
  * If you want to use this Bridge in an existing Android app, please
  * see the source for BridgeActivity for the methods you'll need to
  * pass through to Bridge:
  * <a href="https://github.com/ionic-team/capacitor/blob/HEAD/android/capacitor/src/main/java/com/getcapacitor/BridgeActivity.java">
- *   BridgeActivity.java</a>
+ * BridgeActivity.java</a>
  */
-public class Bridge {
+public class Bridge implements IPostMessage {
 
     private static final String PREFS_NAME = "CapacitorSettings";
     private static final String PERMISSION_PREFS_NAME = "PluginPermStates";
@@ -75,6 +94,7 @@ public class Bridge {
     private static final String BUNDLE_LAST_PLUGIN_CALL_METHOD_NAME_KEY = "capacitorLastActivityPluginMethod";
     private static final String BUNDLE_PLUGIN_CALL_OPTIONS_SAVED_KEY = "capacitorLastPluginCallOptions";
     private static final String BUNDLE_PLUGIN_CALL_BUNDLE_KEY = "capacitorLastPluginCallBundle";
+    private static final String BUNDLE_SESSION_PARCELABLE_BUNDLE_KEY = "geckoviewSessionState";
     private static final String LAST_BINARY_VERSION_CODE = "lastBinaryVersionCode";
     private static final String LAST_BINARY_VERSION_NAME = "lastBinaryVersionName";
     private static final String MINIMUM_ANDROID_WEBVIEW_ERROR = "System WebView is not supported";
@@ -85,6 +105,7 @@ public class Bridge {
     public static final String CAPACITOR_HTTPS_SCHEME = "https";
     public static final String CAPACITOR_FILE_START = "/_capacitor_file_";
     public static final String CAPACITOR_CONTENT_START = "/_capacitor_content_";
+
     public static final int DEFAULT_ANDROID_WEBVIEW_VERSION = 60;
     public static final int MINIMUM_ANDROID_WEBVIEW_VERSION = 55;
 
@@ -102,8 +123,6 @@ public class Bridge {
     private HostMask appAllowNavigationMask;
     private Set<String> allowedOriginRules = new HashSet<String>();
     // A reference to the main WebView for the app
-    private final WebView webView;
-    public final MockCordovaInterfaceImpl cordovaInterface;
     private CordovaWebView cordovaWebView;
     private CordovaPreferences preferences;
     private BridgeWebViewClient webViewClient;
@@ -145,45 +164,55 @@ public class Bridge {
     private RouteProcessor routeProcessor;
 
     // A pre-determined path to load the bridge
+
     private ServerPath serverPath;
+
+    private WebExtensionPortProxy webExtensionPortProxy;
+    public final MockCordovaInterfaceImpl cordovaInterface;
+    private WebviewExtension webviewExtension;
+    private final static String BUILD_INSTALL = "resource://android/assets/";
+    private NanoHTTPD server;
+
+    private GeckoSession.SessionState mSessionState;
 
     /**
      * Create the Bridge with a reference to the main {@link Activity} for the
-     * app, and a reference to the {@link WebView} our app will use.
+     * app, and a reference to the {@link GeckoView} our app will use.
+     *
      * @param context
      * @param webView
      * @deprecated Use {@link Bridge.Builder} to create Bridge instances
      */
     @Deprecated
     public Bridge(
-        AppCompatActivity context,
-        WebView webView,
-        List<Class<? extends Plugin>> initialPlugins,
-        MockCordovaInterfaceImpl cordovaInterface,
-        PluginManager pluginManager,
-        CordovaPreferences preferences,
-        CapConfig config
+            AppCompatActivity context,
+            GeckoView webView,
+            List<Class<? extends Plugin>> initialPlugins,
+            MockCordovaInterfaceImpl cordovaInterface,
+            PluginManager pluginManager,
+            CordovaPreferences preferences,
+            CapConfig config
     ) {
         this(context, null, null, webView, initialPlugins, new ArrayList<>(), cordovaInterface, pluginManager, preferences, config);
     }
 
     private Bridge(
-        AppCompatActivity context,
-        ServerPath serverPath,
-        Fragment fragment,
-        WebView webView,
-        List<Class<? extends Plugin>> initialPlugins,
-        List<Plugin> pluginInstances,
-        MockCordovaInterfaceImpl cordovaInterface,
-        PluginManager pluginManager,
-        CordovaPreferences preferences,
-        CapConfig config
+            AppCompatActivity context,
+            ServerPath serverPath,
+            Fragment fragment,
+            GeckoView webView,
+            List<Class<? extends Plugin>> initialPlugins,
+            List<Plugin> pluginInstances,
+            MockCordovaInterfaceImpl cordovaInterface,
+            PluginManager pluginManager,
+            CordovaPreferences preferences,
+            CapConfig config
     ) {
         this.app = new App();
         this.serverPath = serverPath;
         this.context = context;
         this.fragment = fragment;
-        this.webView = webView;
+        this.webviewExtension = new WebviewExtension(webView);
         this.webViewClient = new BridgeWebViewClient(this);
         this.initialPlugins = initialPlugins;
         this.pluginInstances = pluginInstances;
@@ -235,7 +264,37 @@ public class Bridge {
         return app;
     }
 
+    private void startRandomPort() {
+        //        bind port retry 3 times
+        for (int retry = 0; retry < 3 && server == null; retry++) {
+            try {
+                int port = 1024 + new Random().nextInt(64511);
+                config.setPort(port);
+                server = new SimpleHttpServer(context, this);
+                server.start();
+            } catch (IOException e) {
+                e.printStackTrace();
+                server = null;
+            }
+        }
+    }
+
     private void loadWebView() {
+
+        startRandomPort();
+        String overriddenUserAgentString = TextUtils.isEmpty(config.getOverriddenUserAgentString()) ? "" : config.getOverriddenUserAgentString();
+        String appendedUserAgentString = TextUtils.isEmpty(config.getAppendedUserAgentString()) ? "" : config.getAppendedUserAgentString();
+        GeckoSessionSettings sessionSettings = new GeckoSessionSettings.Builder()
+                .allowJavascript(true)
+                .userAgentOverride("random_port/" + config.getPort() + ";" + overriddenUserAgentString + appendedUserAgentString)
+                .build();
+        GeckoSession session = new GeckoSession(sessionSettings);
+        session.setContentDelegate(new GeckoSession.ContentDelegate() {
+
+        });
+
+        webviewExtension.setSession(session);
+
         appUrlConfig = this.getServerUrl();
         String[] appAllowNavigationConfig = this.config.getAllowNavigation();
 
@@ -281,12 +340,10 @@ public class Bridge {
 
         Logger.debug("Loading app at " + appUrl);
 
-        webView.setWebChromeClient(new BridgeWebChromeClient(this));
-        webView.setWebViewClient(this.webViewClient);
 
         if (!isDeployDisabled() && !isNewBinary()) {
             SharedPreferences prefs = getContext()
-                .getSharedPreferences(com.getcapacitor.plugin.WebView.WEBVIEW_PREFS_NAME, Activity.MODE_PRIVATE);
+                    .getSharedPreferences(com.getcapacitor.plugin.WebView.WEBVIEW_PREFS_NAME, Activity.MODE_PRIVATE);
             String path = prefs.getString(com.getcapacitor.plugin.WebView.CAP_SERVER_PATH, null);
             if (path != null && !path.isEmpty() && new File(path).exists()) {
                 setServerBasePath(path);
@@ -296,7 +353,7 @@ public class Bridge {
         if (!this.isMinimumWebViewInstalled()) {
             String errorUrl = this.getErrorUrl();
             if (errorUrl != null) {
-                webView.loadUrl(errorUrl);
+//                webView.loadUrl(errorUrl);
                 return;
             } else {
                 Logger.error(MINIMUM_ANDROID_WEBVIEW_ERROR);
@@ -312,8 +369,22 @@ public class Bridge {
             }
         } else {
             // Get to work
-            webView.loadUrl(appUrl);
+//            webView.loadUrl(appUrl);
         }
+        listener = new ViewTreeObserver.OnGlobalLayoutListener() {
+            @Override
+            public void onGlobalLayout() {
+                webviewExtension.getSession().loadUri(appUrl);
+                removeListener();
+            }
+        };
+        this.webviewExtension.getWebview().getViewTreeObserver().addOnGlobalLayoutListener(listener);
+    }
+
+    ViewTreeObserver.OnGlobalLayoutListener listener = null;
+
+    private void removeListener() {
+        this.webviewExtension.getWebview().getViewTreeObserver().removeOnGlobalLayoutListener(listener);
     }
 
     @SuppressLint("WebViewApiAvailability")
@@ -385,7 +456,7 @@ public class Bridge {
         String versionCode = "";
         String versionName = "";
         SharedPreferences prefs = getContext()
-            .getSharedPreferences(com.getcapacitor.plugin.WebView.WEBVIEW_PREFS_NAME, Activity.MODE_PRIVATE);
+                .getSharedPreferences(com.getcapacitor.plugin.WebView.WEBVIEW_PREFS_NAME, Activity.MODE_PRIVATE);
         String lastVersionCode = prefs.getString(LAST_BINARY_VERSION_CODE, null);
         String lastVersionName = prefs.getString(LAST_BINARY_VERSION_NAME, null);
 
@@ -419,11 +490,11 @@ public class Bridge {
     public void handleAppUrlLoadError(Exception ex) {
         if (ex instanceof SocketTimeoutException) {
             Logger.error(
-                "Unable to load app. Ensure the server is running at " +
-                appUrl +
-                ", or modify the " +
-                "appUrl setting in capacitor.config.json (make sure to npx cap copy after to commit changes).",
-                ex
+                    "Unable to load app. Ensure the server is running at " +
+                            appUrl +
+                            ", or modify the " +
+                            "appUrl setting in capacitor.config.json (make sure to npx cap copy after to commit changes).",
+                    ex
             );
         }
     }
@@ -438,6 +509,7 @@ public class Bridge {
 
     /**
      * Get the Context for the App
+     *
      * @return
      */
     public Context getContext() {
@@ -446,6 +518,7 @@ public class Bridge {
 
     /**
      * Get the activity for the app
+     *
      * @return
      */
     public AppCompatActivity getActivity() {
@@ -464,14 +537,16 @@ public class Bridge {
 
     /**
      * Get the core WebView under Capacitor's control
+     *
      * @return
      */
-    public WebView getWebView() {
-        return this.webView;
+    public WebviewExtension getWebView() {
+        return this.webviewExtension;
     }
 
     /**
      * Get the URI that was used to launch the app (if any)
+     *
      * @return
      */
     public Uri getIntentUri() {
@@ -480,6 +555,7 @@ public class Bridge {
 
     /**
      * Get scheme that is used to serve content
+     *
      * @return
      */
     public String getScheme() {
@@ -488,6 +564,7 @@ public class Bridge {
 
     /**
      * Get host name that is used to serve content
+     *
      * @return
      */
     public String getHost() {
@@ -496,6 +573,7 @@ public class Bridge {
 
     /**
      * Get the server url that is used to serve content
+     *
      * @return
      */
     public String getServerUrl() {
@@ -534,38 +612,17 @@ public class Bridge {
      */
     @SuppressLint("SetJavaScriptEnabled")
     private void initWebView() {
-        WebSettings settings = webView.getSettings();
-        settings.setJavaScriptEnabled(true);
-        settings.setDomStorageEnabled(true);
-        settings.setGeolocationEnabled(true);
-        settings.setDatabaseEnabled(true);
-        settings.setMediaPlaybackRequiresUserGesture(false);
-        settings.setJavaScriptCanOpenWindowsAutomatically(true);
-        if (this.config.isMixedContentAllowed()) {
-            settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
-        }
-
-        String appendUserAgent = this.config.getAppendedUserAgentString();
-        if (appendUserAgent != null) {
-            String defaultUserAgent = settings.getUserAgentString();
-            settings.setUserAgentString(defaultUserAgent + " " + appendUserAgent);
-        }
-        String overrideUserAgent = this.config.getOverriddenUserAgentString();
-        if (overrideUserAgent != null) {
-            settings.setUserAgentString(overrideUserAgent);
-        }
-
         String backgroundColor = this.config.getBackgroundColor();
         try {
             if (backgroundColor != null) {
-                webView.setBackgroundColor(WebColor.parseColor(backgroundColor));
+                webviewExtension.getWebview().setBackgroundColor(WebColor.parseColor(backgroundColor));
             }
         } catch (IllegalArgumentException ex) {
             Logger.debug("WebView background color not applied");
         }
 
         if (config.isInitialFocus()) {
-            webView.requestFocusFromTouch();
+            webviewExtension.getWebview().requestFocusFromTouch();
         }
 
         WebView.setWebContentsDebuggingEnabled(this.config.isWebContentsDebuggingEnabled());
@@ -590,6 +647,7 @@ public class Bridge {
 
     /**
      * Register additional plugins
+     *
      * @param pluginClasses the plugins to register
      */
     public void registerPlugins(Class<? extends Plugin>[] pluginClasses) {
@@ -617,6 +675,7 @@ public class Bridge {
 
     /**
      * Register a plugin class
+     *
      * @param pluginClass a class inheriting from Plugin
      */
     public void registerPlugin(Class<? extends Plugin> pluginClass) {
@@ -670,10 +729,10 @@ public class Bridge {
 
     private void logInvalidPluginException(Class<? extends Plugin> clazz) {
         Logger.error(
-            "NativePlugin " +
-            clazz.getName() +
-            " is invalid. Ensure the @CapacitorPlugin annotation exists on the plugin class and" +
-            " the class extends Plugin"
+                "NativePlugin " +
+                        clazz.getName() +
+                        " is invalid. Ensure the @CapacitorPlugin annotation exists on the plugin class and" +
+                        " the class extends Plugin"
         );
     }
 
@@ -688,6 +747,7 @@ public class Bridge {
     /**
      * Find the plugin handle that responds to the given request code. This will
      * fire after certain Android OS intent results/permission checks/etc.
+     *
      * @param requestCode
      * @return
      */
@@ -731,9 +791,10 @@ public class Bridge {
 
     /**
      * Call a method on a plugin.
-     * @param pluginId the plugin id to use to lookup the plugin handle
+     *
+     * @param pluginId   the plugin id to use to lookup the plugin handle
      * @param methodName the name of the method to call
-     * @param call the call object to pass to the method
+     * @param call       the call object to pass to the method
      */
     public void callPluginMethod(String pluginId, final String methodName, final PluginCall call) {
         try {
@@ -747,14 +808,14 @@ public class Bridge {
 
             if (Logger.shouldLog()) {
                 Logger.verbose(
-                    "callback: " +
-                    call.getCallbackId() +
-                    ", pluginId: " +
-                    plugin.getId() +
-                    ", methodName: " +
-                    methodName +
-                    ", methodData: " +
-                    call.getData().toString()
+                        "callback: " +
+                                call.getCallbackId() +
+                                ", pluginId: " +
+                                plugin.getId() +
+                                ", methodName: " +
+                                methodName +
+                                ", methodData: " +
+                                call.getData().toString()
                 );
             }
 
@@ -783,13 +844,14 @@ public class Bridge {
     /**
      * Evaluate JavaScript in the web view. This method
      * executes on the main thread automatically.
-     * @param js the JS to execute
+     *
+     * @param js       the JS to execute
      * @param callback an optional ValueCallback that will synchronously receive a value
      *                 after calling the JS
      */
     public void eval(final String js, final ValueCallback<String> callback) {
         Handler mainHandler = new Handler(context.getMainLooper());
-        mainHandler.post(() -> webView.evaluateJavascript(js, callback));
+        mainHandler.post(() -> webExtensionPortProxy.eval(js));
     }
 
     public void logToJs(final String message, final String level) {
@@ -801,11 +863,13 @@ public class Bridge {
     }
 
     public void triggerJSEvent(final String eventName, final String target) {
-        eval("window.Capacitor.triggerEvent(\"" + eventName + "\", \"" + target + "\")", s -> {});
+        eval("window.Capacitor.triggerEvent(\"" + eventName + "\", \"" + target + "\")", s -> {
+        });
     }
 
     public void triggerJSEvent(final String eventName, final String target, final String data) {
-        eval("window.Capacitor.triggerEvent(\"" + eventName + "\", \"" + target + "\", " + data + ")", s -> {});
+        eval("window.Capacitor.triggerEvent(\"" + eventName + "\", \"" + target + "\", " + data + ")", s -> {
+        });
     }
 
     public void triggerWindowJSEvent(final String eventName) {
@@ -836,6 +900,7 @@ public class Bridge {
 
     /**
      * Retain a call between plugin invocations
+     *
      * @param call
      */
     public void saveCall(PluginCall call) {
@@ -844,6 +909,7 @@ public class Bridge {
 
     /**
      * Get a retained plugin call
+     *
      * @param callbackId the callbackId to use to lookup the call with
      * @return the stored call
      */
@@ -867,6 +933,7 @@ public class Bridge {
 
     /**
      * Release a retained call
+     *
      * @param call a call to release
      */
     public void releaseCall(PluginCall call) {
@@ -875,6 +942,7 @@ public class Bridge {
 
     /**
      * Release a retained call by its ID
+     *
      * @param callbackId an ID of a callback to release
      */
     public void releaseCall(String callbackId) {
@@ -922,8 +990,8 @@ public class Bridge {
      * @return A registered Activity Result Launcher.
      */
     public <I, O> ActivityResultLauncher<I> registerForActivityResult(
-        @NonNull final ActivityResultContract<I, O> contract,
-        @NonNull final ActivityResultCallback<O> callback
+            @NonNull final ActivityResultContract<I, O> contract,
+            @NonNull final ActivityResultCallback<O> callback
     ) {
         if (fragment != null) {
             return fragment.registerForActivityResult(contract, callback);
@@ -955,13 +1023,18 @@ public class Bridge {
 
     /**
      * Restore any saved bundle state data
+     *
      * @param savedInstanceState
      */
     public void restoreInstanceState(Bundle savedInstanceState) {
         String lastPluginId = savedInstanceState.getString(BUNDLE_LAST_PLUGIN_ID_KEY);
         String lastPluginCallMethod = savedInstanceState.getString(BUNDLE_LAST_PLUGIN_CALL_METHOD_NAME_KEY);
         String lastOptionsJson = savedInstanceState.getString(BUNDLE_PLUGIN_CALL_OPTIONS_SAVED_KEY);
-
+        GeckoSession.SessionState sessionState = savedInstanceState.getParcelable(BUNDLE_SESSION_PARCELABLE_BUNDLE_KEY);
+        if (sessionState != null) {
+            this.setSessionState(sessionState);
+            this.getWebView().getSession().restoreState(sessionState);
+        }
         if (lastPluginId != null) {
             // If we have JSON blob saved, create a new plugin call with the original options
             if (lastOptionsJson != null) {
@@ -969,7 +1042,7 @@ public class Bridge {
                     JSObject options = new JSObject(lastOptionsJson);
 
                     pluginCallForLastActivity =
-                        new PluginCall(msgHandler, lastPluginId, PluginCall.CALLBACK_ID_DANGLING, lastPluginCallMethod, options);
+                            new PluginCall(msgHandler, lastPluginId, PluginCall.CALLBACK_ID_DANGLING, lastPluginCallMethod, options);
                 } catch (JSONException ex) {
                     Logger.error("Unable to restore plugin call, unable to parse persisted JSON object", ex);
                 }
@@ -994,7 +1067,6 @@ public class Bridge {
         if (pluginCallForLastActivity != null) {
             PluginCall call = pluginCallForLastActivity;
             PluginHandle handle = getPlugin(call.getPluginId());
-
             if (handle != null) {
                 Bundle bundle = handle.getInstance().saveInstanceState();
                 if (bundle != null) {
@@ -1002,6 +1074,9 @@ public class Bridge {
                     outState.putString(BUNDLE_LAST_PLUGIN_CALL_METHOD_NAME_KEY, call.getMethodName());
                     outState.putString(BUNDLE_PLUGIN_CALL_OPTIONS_SAVED_KEY, call.getData().toString());
                     outState.putBundle(BUNDLE_PLUGIN_CALL_BUNDLE_KEY, bundle);
+                    if (mSessionState != null) {
+                        outState.putParcelable(BUNDLE_SESSION_PARCELABLE_BUNDLE_KEY, mSessionState);
+                    }
                 } else {
                     Logger.error("Couldn't save last " + call.getPluginId() + "'s Plugin " + call.getMethodName() + " call");
                 }
@@ -1023,8 +1098,8 @@ public class Bridge {
      * Check for legacy Capacitor or Cordova plugins that may have registered to handle a permission
      * request, and handle them if so. If not handled, false is returned.
      *
-     * @param requestCode the code that was requested
-     * @param permissions the permissions requested
+     * @param requestCode  the code that was requested
+     * @param permissions  the permissions requested
      * @param grantResults the set of granted/denied permissions
      * @return true if permission code was handled by a plugin explicitly, false if not
      */
@@ -1111,8 +1186,8 @@ public class Bridge {
     /**
      * Helper to check all permissions and see the current states of each permission.
      *
-     * @since 3.0.0
      * @return A mapping of permission aliases to the associated granted status.
+     * @since 3.0.0
      */
     protected Map<String, PermissionState> getPermissionStates(Plugin plugin) {
         Map<String, PermissionState> permissionsResults = new HashMap<>();
@@ -1164,6 +1239,7 @@ public class Bridge {
     /**
      * Handle an activity result and pass it to a plugin that has indicated it wants to
      * handle the result.
+     *
      * @param requestCode
      * @param resultCode
      * @param data
@@ -1198,6 +1274,7 @@ public class Bridge {
 
     /**
      * Handle an onNewIntent lifecycle event and notify the plugins
+     *
      * @param intent
      */
     public void onNewIntent(Intent intent) {
@@ -1212,6 +1289,7 @@ public class Bridge {
 
     /**
      * Handle an onConfigurationChanged event and notify the plugins
+     *
      * @param newConfig
      */
     public void onConfigurationChanged(Configuration newConfig) {
@@ -1301,8 +1379,10 @@ public class Bridge {
      * Handle onDetachedFromWindow lifecycle event
      */
     public void onDetachedFromWindow() {
-        webView.removeAllViews();
-        webView.destroy();
+//        webView.removeAllViews();
+//        webView.destroy();
+        this.getWebView().getWebview().onDetachedFromWindow();
+        this.getWebView().getWebview().removeAllViews();
     }
 
     public String getServerBasePath() {
@@ -1312,28 +1392,30 @@ public class Bridge {
     /**
      * Tell the local server to load files from the given
      * file path instead of the assets path.
+     *
      * @param path
      */
     public void setServerBasePath(String path) {
         localServer.hostFiles(path);
-        webView.post(() -> webView.loadUrl(appUrl));
+        webviewExtension.getWebview().post(() -> this.webviewExtension.getSession().loadUri(appUrl));
     }
 
     /**
      * Tell the local server to load files from the given
      * asset path.
+     *
      * @param path
      */
     public void setServerAssetPath(String path) {
         localServer.hostAssets(path);
-        webView.post(() -> webView.loadUrl(appUrl));
+        webviewExtension.getWebview().post(() -> this.webviewExtension.getSession().loadUri(appUrl));
     }
 
     /**
      * Reload the WebView
      */
     public void reload() {
-        webView.post(() -> webView.loadUrl(appUrl));
+        webviewExtension.getWebview().post(() -> this.webviewExtension.getSession().loadUri(appUrl));
     }
 
     public String getLocalUrl() {
@@ -1358,7 +1440,7 @@ public class Bridge {
 
     public void setWebViewClient(BridgeWebViewClient client) {
         this.webViewClient = client;
-        webView.setWebViewClient(client);
+//        webView.setWebViewClient(client);
     }
 
     List<WebViewListener> getWebViewListeners() {
@@ -1383,6 +1465,7 @@ public class Bridge {
 
     /**
      * Add a listener that the WebViewClient can trigger on certain events.
+     *
      * @param webViewListener A {@link WebViewListener} to add.
      */
     public void addWebViewListener(WebViewListener webViewListener) {
@@ -1391,6 +1474,7 @@ public class Bridge {
 
     /**
      * Remove a listener that the WebViewClient triggers on certain events.
+     *
      * @param webViewListener A {@link WebViewListener} to remove.
      */
     public void removeWebViewListener(WebViewListener webViewListener) {
@@ -1479,6 +1563,7 @@ public class Bridge {
             return this;
         }
 
+        @SuppressLint("WrongThread")
         public Bridge create() {
             // Cordova initialization
             ConfigXmlParser parser = new ConfigXmlParser();
@@ -1491,26 +1576,53 @@ public class Bridge {
             if (instanceState != null) {
                 cordovaInterface.restoreInstanceState(instanceState);
             }
-
-            WebView webView = this.fragment != null ? fragment.getView().findViewById(R.id.webview) : activity.findViewById(R.id.webview);
-            MockCordovaWebViewImpl mockWebView = new MockCordovaWebViewImpl(activity.getApplicationContext());
+            GeckoView webView = this.fragment != null ? fragment.getView().findViewById(R.id.webview) : activity.findViewById(R.id.webview);
+            MockCordovaGeckoviewImpl mockWebView = new MockCordovaGeckoviewImpl(activity.getApplicationContext());
             mockWebView.init(cordovaInterface, pluginEntries, preferences, webView);
             PluginManager pluginManager = mockWebView.getPluginManager();
             cordovaInterface.onCordovaInit(pluginManager);
 
+            if (config == null)
+                config = CapConfig.loadDefault(activity.getApplicationContext());
+            GeckoRuntimeSettings runTimeSettings = new GeckoRuntimeSettings.Builder()
+                    .configFilePath("")
+                    .javaScriptEnabled(true)
+                    .loginAutofillEnabled(true)
+                    .webManifest(false)
+                    .aboutConfigEnabled(false)
+                    .remoteDebuggingEnabled(true)
+                    .build();
+            GeckoRuntime sRuntime = GeckoRuntime
+                    .create(activity, runTimeSettings);
+
             // Bridge initialization
             Bridge bridge = new Bridge(
-                activity,
-                serverPath,
-                fragment,
-                webView,
-                plugins,
-                pluginInstances,
-                cordovaInterface,
-                pluginManager,
-                preferences,
-                config
+                    activity,
+                    serverPath,
+                    fragment,
+                    webView,
+                    plugins,
+                    pluginInstances,
+                    cordovaInterface,
+                    pluginManager,
+                    preferences,
+                    config
             );
+            webView.setSession(bridge.getWebView().getSession());
+            webView.getSession().setProgressDelegate(new GeckoSession.ProgressDelegate() {
+                @Override
+                public void onSessionStateChange(@NonNull GeckoSession session, @NonNull GeckoSession.SessionState sessionState) {
+//                    GeckoSession.ProgressDelegate.super.onSessionStateChange(session, sessionState);
+                    String value = "";
+                    if (sessionState != null) {
+                        value = sessionState.toString();
+                    }
+                    Log.i("geckoview", "onSessionStateChange when " + System.currentTimeMillis() + "ms " + value);
+                    bridge.setSessionState(sessionState);
+                }
+            });
+            webView.getSession().open(sRuntime);
+
             bridge.setCordovaWebView(mockWebView);
             bridge.setWebViewListeners(webViewListeners);
             bridge.setRouteProcessor(routeProcessor);
@@ -1519,7 +1631,41 @@ public class Bridge {
                 bridge.restoreInstanceState(instanceState);
             }
 
+            WebExtensionPortProxy webExtensionProxy = new WebExtensionPortProxy(bridge);
+            WebExtension.PortDelegate portDelegate = new PortDelegate(webExtensionProxy);
+            WebExtension.MessageDelegate messageDelegate = new MessageDelegate(webExtensionProxy, portDelegate);
+            sRuntime
+                    .getWebExtensionController()
+                    .ensureBuiltIn(BUILD_INSTALL, "messaging@example.com")
+                    .accept(
+                            // Set delegate that will receive messages coming from this extension.
+                            extension ->
+                                    extension
+                                            .setMessageDelegate(messageDelegate, "browser"),
+                            // Something bad happened, let's log an error
+                            e -> Log.e("MessageDelegate", "Error registering extension", e));
+            mockWebView.setProxy(webExtensionProxy);
+            mockWebView.setHttpServer(bridge.server);
+            bridge.setWebExtensionPortProxy(webExtensionProxy);
+
             return bridge;
         }
+    }
+
+    @Override
+    public void postMessage(Object message) {
+        this.msgHandler.postMessage(message.toString());
+    }
+
+    public void setWebExtensionPortProxy(WebExtensionPortProxy proxy) {
+        this.webExtensionPortProxy = proxy;
+    }
+
+    public WebExtensionPortProxy getWebExtensionPortProxy() {
+        return this.webExtensionPortProxy;
+    }
+
+    public void setSessionState(GeckoSession.SessionState sessionState) {
+        this.mSessionState = sessionState;
     }
 }
